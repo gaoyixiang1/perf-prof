@@ -1,3 +1,4 @@
 perf-prof-$(CONFIG_LIBBPF) += kvm_exit.skel.h
 # perf-prof-$(CONFIG_LIBBPF) += bpf_test.skel.h
-perf-prof-$(CONFIG_LIBBPF) += bpf_stack_iter.skel.h
+# perf-prof-$(CONFIG_LIBBPF) += bpf_stack_iter.skel.h
+perf-prof-$(CONFIG_LIBBPF) += bpf_iter.skel.h
