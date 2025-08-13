@@ -147,6 +147,26 @@ struct env {
     int  exclude_pid;
     int  nr_running_min;
     int  nr_running_max;
+    //ps
+    bool extend;
+    bool wchan;
+    bool aux;
+    bool details;
+    char  *grep;
+    int pidof;
+    int ppid;
+    char *signal;
+    char *pkill_target;
+    //kmemleak
+    char *flamegraph;
+    char *allocs;
+    char *frees;
+    //lsof
+    bool tcp_listen;
+    int port;
+    int match;
+    char *comm;
+    bool unix_file;
     // ebpf end
     char *tp_alloc;
     char *tp_free;

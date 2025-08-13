@@ -232,6 +232,7 @@ static inline int pystack_event_lost(struct prof_dev *dev, union perf_event *eve
     return 0;
 }
 
+
 static void pystack_sample(struct prof_dev *dev, union perf_event *event, int instance)
 {
     struct pystack_ctx *ctx = dev->private;
@@ -248,14 +249,17 @@ static void pystack_sample(struct prof_dev *dev, union perf_event *event, int in
         } __packed raw;
     } *data = (void *)event->sample.array;
     unsigned short common_type = data->raw.common_type;
-    struct function__entry_return *function = &data->raw.function;
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Waddress-of-packed-member"
+        struct function__entry_return *function = &data->raw.function;
+    #pragma GCC diagnostic pop
     const char *filename = (const char *)function + function->filename_offset;
     const char *funcname = (const char *)function + function->funcname_offset;
     int lineno = function->lineno;
     struct pystack_node tmp, *node;
     struct rb_node *rbn;
     char buf[4096];
-
+    
     if (!function->common_pid)
         return;
 
