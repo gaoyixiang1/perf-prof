@@ -165,7 +165,7 @@ struct env {
     bool tcp_listen;
     int port;
     int match;
-    char *comm;
+    char *path;
     bool unix_file;
     // ebpf end
     char *tp_alloc;

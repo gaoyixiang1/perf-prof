@@ -490,7 +490,7 @@ struct option main_options[] = {
      OPT_INT_NONEG   (0,    "match", &env.match,   "match",            "0 match comm / 1 match cmd / 2 means pgrep -la"),
      OPT_STRDUP_NONEG(0, "pkill_target", &env.pkill_target, "pkill_target", "Target process name"),
     OPT_STRDUP_NONEG(0, "signal", &env.signal, "signal", "Signal name/number"),
-    OPT_STRDUP_NONEG(0, "comm", &env.comm, "comm", "grep comm"),
+    OPT_STRDUP_NONEG(0, "path", &env.path, "path", "grep path name"),
 
 
     OPT_GROUP("PROFILER OPTION:"),
