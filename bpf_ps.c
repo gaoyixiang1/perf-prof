@@ -598,7 +598,7 @@ static void format_task_output(struct bpfiter_ctx *ctx, struct task_info *info,
         if (ctx->print_header)
         {
             ctx->print_header = false;
-            fprintf(out, "%-7s %-8s  %-8s  %-8s %-8s, %-4s   %-5s %-6s %-10s    %-15s  \n",
+            fprintf(out, "%-7s %-8s  %-8s  %-8s %-8s %-4s   %-5s %-6s %-10s    %-15s  \n",
                         "USER", "PID","PPID", "TID","NUM_THREADS","TTY", "%CPU","START", "TIME", "COMMAND");
         }
         if (pw)
@@ -611,7 +611,7 @@ static void format_task_output(struct bpfiter_ctx *ctx, struct task_info *info,
                 details.user_str[8] = '\0';
             }
         }
-        fprintf(out, " %-8s %-8d %-8d %-8d %-8d %-3s  %-3s %-6s %-8s   %-12s\n",
+        fprintf(out, " %-8s %-8d %-8d %-8d %-12d %-3s  %-3s %-6s %-8s   %-12s\n",
                 details.user_str, info->pid, info->ppid, info->lwp, info->num_threads, info->tty, cpu_str, start_str, details.time_str, details.comm_str);
     
     }
@@ -1043,7 +1043,7 @@ static const char *bpf_ps_desc[] = PROFILER_DESC("bpf:bpf_ps",
                                                  "    " PROGRAME " bpf:bpf_ps --details",
                                                  "    " PROGRAME " bpf:bpf_ps --grep comm",
                                                  "    " PROGRAME " bpf:bpf_ps --pidof target_pid",
-                                                 "    " PROGRAME " bpf:bpf_ps --signal 9 --match 0 --pkill_target comm");
+                                                 "    " PROGRAME " bpf:bpf_ps --signal signal_num --match mode --pkill_target comm");
 
 static const char *bpf_ps_args[] = PROFILER_ARGV("bpf:bpf_ps",
                                                  PROFILER_ARGV_OPTION,

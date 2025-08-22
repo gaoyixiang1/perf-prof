@@ -161,6 +161,7 @@ struct env {
     char *flamegraph;
     char *allocs;
     char *frees;
+    bool time_order;
     //lsof
     bool tcp_listen;
     int port;

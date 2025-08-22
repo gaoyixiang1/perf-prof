@@ -134,15 +134,8 @@ int dump_task_file(struct bpf_iter__task_file *ctx)
     info->major = major;
     info->minor = minor;
     unsigned long long size_or_off = 0;
-    if (info->ftype == S_IFREG)
-    {
-        size_or_off = BPF_CORE_READ(file, f_pos);
-    }
-    else
-    {
-        size_or_off = BPF_CORE_READ(file, f_pos);
-    }
-    info->size_or_off = size_or_off;
+   
+    info->size_or_off = BPF_CORE_READ(file, f_pos);
 
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, info, sizeof(*info));
     return 0;

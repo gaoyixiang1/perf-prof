@@ -245,13 +245,13 @@ static void handle_events(void *ctx, int cpu, void *data, __u32 size)
        
         if (bpf_ctx->print_header)
         {
-            fprintf(out, " %-15s %-8s %-8s  %-10s %-20s %-8s\n",
-                    "COMMAND", "PID", "USER", "PORT", "STATE", "NAME");
+            fprintf(out, " %-15s %-8s %-8s  %-6s %-10s %-8s\n",
+                    "COMMAND", "PID", "USER", "FD","SIZE/OFF", "NAME");
             bpf_ctx->print_header = false;
         }
-        fprintf(out, "%-15s %-8d %-8s  %-10s %-20s %-8s\n",
+        fprintf(out, "%-15s %-8d %-8s  %-6d %-10s %-8s\n",
                 info->comm, info->pid, user_str,
-                port_buf, state_buf, name_buf);
+                info->fd, size_buf, name_buf);
     }
     else if (env->pidof && env->tcp_listen)
     {
@@ -434,7 +434,6 @@ static int bpf_lsof_filter(struct prof_dev *dev)
     map_fd = bpf_map__fd(ctx->skel->maps.events);
 
     ctx->pb = perf_buffer__new(map_fd, 256, handle_events, NULL, ctx, NULL);
-
     if (libbpf_get_error(ctx->pb))
     {
         fprintf(stderr, "Failed to create perf buffer\n");

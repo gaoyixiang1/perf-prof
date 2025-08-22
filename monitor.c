@@ -468,6 +468,7 @@ struct option main_options[] = {
     OPT_BOOL_NONEG  ( 0 ,   "exclude-kernel", &env.exclude_kernel,              "exclude kernel"),
      OPT_BOOL_NONEG  ( 0 ,   "extend", &env.extend,                          "print extend info such as lstart sch cls prio"),
     OPT_BOOL_NONEG  ( 0 ,   "wchan", &env.wchan,                          "print wchan name"),
+    OPT_BOOL_NONEG  ( 0 ,   "time_order", &env.time_order,                          "time order"),
     OPT_BOOL_NONEG  ( 0 ,   "aux", &env.aux,                          "print ps aux info"),
      OPT_BOOL_NONEG  ( 0 ,   "tcp_listen", &env.tcp_listen,                          "print tcp_listen"),
      OPT_BOOL_NONEG  ( 0 ,   "unix_file", &env.unix_file,                          "print unix_file type"),

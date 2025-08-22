@@ -63,14 +63,6 @@ int dump_task_info(struct bpf_iter__task *ctx)
         bpf_seq_write(ctx->meta->seq, &info, sizeof(info));
         return 0;
     }
-    // //--pid
-    // if (field_config.pid > 0 && task->pid != field_config.pid)
-    // {
-    //     return 0;
-    // }
-
-    // if (field_config.only_process && task->pid != task->tgid)
-    //     return 0;
 
     info = bpf_map_lookup_elem(&task_info_storage, &zero);
     if (!info)

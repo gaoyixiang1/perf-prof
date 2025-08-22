@@ -1,3 +1,4 @@
 perf-prof-$(CONFIG_LIBBPF) += kvm_exit.skel.h
 perf-prof-$(CONFIG_LIBBPF) += bpf_ps.skel.h
 perf-prof-$(CONFIG_LIBBPF) += bpf_lsof.skel.h
+perf-prof-$(CONFIG_LIBBPF) += bpf_kmemleak.skel.h
