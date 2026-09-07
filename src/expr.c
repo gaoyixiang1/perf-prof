@@ -499,8 +499,12 @@ struct expr_prog *expr_compile_flags(char *expr_str, struct global_var_declare *
     int i, err;
     int nr_insn = 1024;
     int datasize = 256;
-    int strsize = strlen(expr_str);
+    /* Upper bound on the literals: each one loses its two delimiters and gains
+     * a terminator, so it never outgrows its source text. The +1 guarantees a
+     * zero byte past the last literal, where expr_dump() stops walking. */
+    int strsize = strlen(expr_str) + 1;
     char *d, *s;
+    char *names = NULL, *nm;
     struct expr_prog *prog = NULL;
 
     // reset
@@ -571,21 +575,21 @@ struct expr_prog *expr_compile_flags(char *expr_str, struct global_var_declare *
             name_size += strlen(declare->name) + 1;
             declare ++;
         }
-        s = realloc(s, name_size + strsize);
-        if (!s) goto err_return;
-        memset(s + name_size, 0, strsize);
+        /* Copy the names: declare[] and its name fields (e.g. the synthetic
+         * "_offset", "_len") are temporary and the caller frees them once this
+         * returns, yet symtab[].name keeps pointing at them for expr_dump().
+         * They get a buffer of their own rather than sharing `str', which then
+         * holds nothing but the expression's own string literals. */
+        names = malloc(name_size);
+        if (!names) goto err_return;
 
     restart:
         max_offset = 0;
         declare = save;
-        str = s;
+        nm = names;
         while (declare->name) {
-            // FIX: Copy declare->name to safe buffer to prevent access after free
-            // declare structure and its name fields (e.g., "_offset", "_len") are temporary
-            // released after expr_compile, but expr_dump needs to access later
-            // Solution: Copy names to str buffer for safe long-term access by expr_dump
-            p = strcpy(str, declare->name);
-            str += strlen(declare->name) + 1;
+            p = strcpy(nm, declare->name);
+            nm += strlen(declare->name) + 1;
             next();
             id->class = Glo;
             switch (declare->elementsize) {
@@ -630,9 +634,15 @@ struct expr_prog *expr_compile_flags(char *expr_str, struct global_var_declare *
 
     prog->symtab = realloc(symtab, n_syms*sizeof(*symtab));
     prog->nr_syms = n_syms;
-    if (data - d) { prog->data = d; prog->datasize = datasize; }
-    else { free(d); prog->data = NULL; prog->datasize = 0; }
-    if (str - s) prog->str = s; else { free(s); prog->str = NULL; }
+    if (data - d) {
+        prog->data = d; prog->datasize = datasize; prog->datalen = data - d;
+    } else {
+        free(d); prog->data = NULL; prog->datasize = 0; prog->datalen = 0;
+    }
+    if (str - s) { prog->str = s; prog->strsize = str - s; }
+    else { free(s); prog->str = NULL; prog->strsize = 0; }
+    prog->names = names;
+    names = NULL;
     prog->insn = realloc(le, nr_insn*sizeof(long));
     prog->nr_insn = nr_insn;
     // FIX: Instruction relocation mechanism for jump targets after realloc
@@ -664,6 +674,7 @@ err_return:
     if (symtab) free(symtab);
     if (d) free(d);
     if (s) free(s);
+    if (names) free(names);
     if (le) free(le);
     if (prog) free(prog);
     return NULL;
@@ -849,6 +860,7 @@ void expr_destroy(struct expr_prog *prog)
     }
     if (prog->symtab) free(prog->symtab);
     if (prog->data) free(prog->data);
+    if (prog->names) free(prog->names);
     if (prog->str) free(prog->str);
     if (prog->insn) free(prog->insn);
     free(prog);
@@ -972,14 +984,16 @@ void expr_dump(struct expr_prog *prog)
  * does not apply, because every builtin that would need one is rejected below.
  */
 
-#define BPF_A          BPF_REG_0          /* accumulator, mirrors VM's `a' */
+/* Named BPF_ACC, not BPF_A: <uapi/linux/filter.h>, pulled in by
+ * <linux/filter.h>, uses BPF_A for a classic-BPF addressing mode. */
+#define BPF_ACC        BPF_REG_0          /* accumulator, mirrors VM's `a' */
 #define BPF_EVENT      BPF_REG_1          /* event pointer, never clobbered */
 #define BPF_SLOT_FIRST BPF_REG_2
 #define BPF_SLOT_LAST  BPF_REG_9
 #define BPF_NR_SLOTS   (BPF_SLOT_LAST - BPF_SLOT_FIRST + 1)
 
-/* Upper bound on emitted instructions per VM instruction: the comparison
- * ops expand to 3, and a signed division expands to more. */
+/* Upper bound on emitted instructions per VM instruction: the comparison ops
+ * expand to 3, a sign-extending load to 3 on kernels without MEMSX. */
 #define BPF_INSN_PER_OP 8
 
 struct bpf_emit {
@@ -989,6 +1003,9 @@ struct bpf_emit {
     int depth;          /* current stack depth, in slots */
     int failed;
     const char *err;
+    /* Whether the target kernel has the cpu v4 instructions -- resolved once
+     * per translation, in expr_to_bpf(). */
+    bool cpu_v4;
     /* Map from VM instruction index to emitted instruction index, so that
      * jump targets can be resolved once everything has been emitted. */
     int *pc_map;
@@ -1048,6 +1065,76 @@ static int bpf_size_of(struct bpf_emit *e, long type)
 }
 
 /*
+ * True when the running kernel has the "cpu v4" instructions -- BPF
+ * instruction-set version 4, what clang calls -mcpu=v4. They all landed
+ * together in v6.6: sign-extension loads in 1f9a1ea821ff ("bpf: Support new
+ * sign-extension load insns") and signed div/mod in ec0e2da95f72 ("bpf:
+ * Support new signed div/mod instructions."), with the x86 and arm64 JITs
+ * (cc88f540da52) in the same release. So one check covers both.
+ *
+ * This has to be a runtime test, not a build-time one: perf-prof is built once
+ * and run on whatever kernel is in front of it, and the filter is generated
+ * for the kernel it is about to be loaded into. It reads uname(), so the
+ * result is cached in bpf_emit rather than asked for per instruction.
+ */
+static bool bpf_have_cpu_v4(void)
+{
+    return kernel_release() >= KERNEL_VERSION(6, 6, 0);
+}
+
+/*
+ * Load a field into `dst'. The userspace VM's LI reads through a pointer of
+ * the field's own type, so a narrow signed field arrives sign-extended; plain
+ * BPF_LDX_MEM zero-extends instead, and the difference is visible to every
+ * signed comparison downstream. Two ways to match the VM:
+ *
+ *   6.6+    one ldx in MEMSX mode. Sizes B/H/W only -- a DW load fills the
+ *           register, so there is nothing left to extend.
+ *   older   shift the sign bit up to bit 63 and arithmetic-shift back down.
+ */
+static void emit_load(struct bpf_emit *e, long type, int dst, int src, int off)
+{
+    int sz = bpf_size_of(e, type);
+    int bits;
+
+    if ((type & UNSIGNED) || type >= PTR || sz == BPF_DW) {
+        emit(e, BPF_LDX_MEM(sz, dst, src, off));
+        return;
+    }
+
+    if (e->cpu_v4) {
+        /* BPF_LDX_MEMSX(sz, dst, src, off), written out: the macro lives in
+         * the kernel's own filter.h, not the tools copy this tree carries. */
+        emit(e, BPF_RAW_INSN(BPF_LDX | BPF_SIZE(sz) | BPF_MEMSX, dst, src, off, 0));
+        return;
+    }
+
+    bits = sz == BPF_B ? 56 : (sz == BPF_H ? 48 : 32);
+    emit(e, BPF_LDX_MEM(sz, dst, src, off));
+    emit(e, BPF_ALU64_IMM(BPF_LSH, dst, bits));
+    emit(e, BPF_ALU64_IMM(BPF_ARSH, dst, bits));
+}
+
+/*
+ * Load a 64-bit constant. BPF_MOV64_IMM only carries 32 bits, sign-extended,
+ * so wider values need ld_imm64, which occupies two instruction slots: the low
+ * half in the first slot's imm, the high half in the second's. The second slot
+ * is not an instruction of its own -- its opcode must be zero -- so jump
+ * offsets, which count slots, stay correct without any special casing.
+ */
+static void emit_imm64(struct bpf_emit *e, int reg, long v)
+{
+    if (v == (int)v) {
+        emit(e, BPF_MOV64_IMM(reg, (int)v));
+        return;
+    }
+    /* BPF_LD_IMM64(reg, v), expanded: the macro is two comma-separated
+     * initialisers, so it cannot be handed to emit() as one argument. */
+    emit(e, BPF_RAW_INSN(BPF_LD | BPF_DW | BPF_IMM, reg, 0, 0, (__u32)v));
+    emit(e, BPF_RAW_INSN(0, 0, 0, 0, (__u32)((__u64)v >> 32)));
+}
+
+/*
  * Emit `a = (slot <cond> a)`. eBPF has no set-on-condition, so materialise
  * the boolean with a branch. The comparison must happen before the result
  * register is written, because the right operand lives in the accumulator:
@@ -1055,10 +1142,10 @@ static int bpf_size_of(struct bpf_emit *e, long type)
  */
 static void emit_cmp(struct bpf_emit *e, int op, int lhs)
 {
-    emit(e, BPF_JMP_REG(op, lhs, BPF_A, 2));
-    emit(e, BPF_MOV64_IMM(BPF_A, 0));
+    emit(e, BPF_JMP_REG(op, lhs, BPF_ACC, 2));
+    emit(e, BPF_MOV64_IMM(BPF_ACC, 0));
     emit(e, BPF_JMP_A(1));
-    emit(e, BPF_MOV64_IMM(BPF_A, 1));
+    emit(e, BPF_MOV64_IMM(BPF_ACC, 1));
 }
 
 /*
@@ -1067,7 +1154,7 @@ static void emit_cmp(struct bpf_emit *e, int op, int lhs)
  */
 struct bpf_insn *expr_to_bpf(struct expr_prog *prog, int *nr_insn)
 {
-    struct bpf_emit e = {};
+    struct bpf_emit e = { .cpu_v4 = bpf_have_cpu_v4() };
     long *pc, *insn_end;
     long *base;
     int i, lhs;
@@ -1104,7 +1191,7 @@ struct bpf_insn *expr_to_bpf(struct expr_prog *prog, int *nr_insn)
         if (sym->token != Id || sym->class != Glo || !sym->ref)
             continue;
         if (prog->data && sym->value >= (long)prog->data &&
-            sym->value < (long)prog->data + prog->datasize)
+            sym->value < (long)prog->data + prog->datalen)
             continue;
         emit_fail(&e, "variable is not a field of the event");
         goto out;
@@ -1125,45 +1212,36 @@ struct bpf_insn *expr_to_bpf(struct expr_prog *prog, int *nr_insn)
                  * a field access: fold the pair into one load off the event
                  * pointer. */
                 if (prog->data && pc < insn_end && *pc == LI &&
-                    v >= (long)prog->data && v < (long)prog->data + prog->datasize) {
+                    v >= (long)prog->data && v < (long)prog->data + prog->datalen) {
                     long type = pc[1];
                     int off = (int)(v - (long)prog->data);
-                    int sz = bpf_size_of(&e, type);
 
                     e.pc_map[pc - base] = e.nr_insn;
                     pc += 2;
-                    emit(&e, BPF_LDX_MEM(sz, BPF_A, BPF_EVENT, off));
-                    /* Narrow loads zero-extend; sign-extend by hand so that
-                     * signed comparisons behave like the userspace VM. */
-                    if (!(type & UNSIGNED) && type < PTR && sz != BPF_DW) {
-                        int bits = sz == BPF_B ? 56 : (sz == BPF_H ? 48 : 32);
-                        emit(&e, BPF_ALU64_IMM(BPF_LSH, BPF_A, bits));
-                        emit(&e, BPF_ALU64_IMM(BPF_ARSH, BPF_A, bits));
-                    }
+                    emit_load(&e, type, BPF_ACC, BPF_EVENT, off);
                 } else if (prog->data &&
                            v >= (long)prog->data &&
-                           v < (long)prog->data + prog->datasize) {
+                           v < (long)prog->data + prog->datalen) {
                     /* Address of a field, e.g. `&pid'. */
-                    emit(&e, BPF_MOV64_REG(BPF_A, BPF_EVENT));
-                    emit(&e, BPF_ALU64_IMM(BPF_ADD, BPF_A, (int)(v - (long)prog->data)));
-                } else if (prog->str && v >= (long)prog->str) {
+                    emit(&e, BPF_MOV64_REG(BPF_ACC, BPF_EVENT));
+                    emit(&e, BPF_ALU64_IMM(BPF_ADD, BPF_ACC, (int)(v - (long)prog->data)));
+                } else if (prog->str && v >= (long)prog->str &&
+                           v < (long)prog->str + prog->strsize) {
                     emit_fail(&e, "string literals are not supported by the BPF backend");
                 } else {
-                    emit(&e, BPF_MOV64_IMM(BPF_A, (int)v));
-                    if (v != (int)v)
-                        emit_fail(&e, "64-bit immediate is not supported by the BPF backend");
+                    emit_imm64(&e, BPF_ACC, v);
                 }
                 break;
             }
             case LI: {
                 /* A dereference that was not folded above: the address is in
-                 * the accumulator. */
-                int sz = bpf_size_of(&e, *pc++);
-                emit(&e, BPF_LDX_MEM(sz, BPF_A, BPF_A, 0));
+                 * the accumulator. Sign-extends just like the folded case,
+                 * which matters for e.g. `*(char *)&field'. */
+                emit_load(&e, *pc++, BPF_ACC, BPF_ACC, 0);
                 break;
             }
             case PSH:
-                emit(&e, BPF_MOV64_REG(slot_reg(&e, e.depth), BPF_A));
+                emit(&e, BPF_MOV64_REG(slot_reg(&e, e.depth), BPF_ACC));
                 e.depth++;
                 if (e.depth > BPF_NR_SLOTS)
                     emit_fail(&e, "expression too deeply nested for register allocation");
@@ -1174,7 +1252,7 @@ struct bpf_insn *expr_to_bpf(struct expr_prog *prog, int *nr_insn)
                 long target = *pc++;
                 int at = e.nr_insn;
 
-                emit(&e, BPF_JMP_IMM(op == BZ ? BPF_JEQ : BPF_JNE, BPF_A, 0, 0));
+                emit(&e, BPF_JMP_IMM(op == BZ ? BPF_JEQ : BPF_JNE, BPF_ACC, 0, 0));
                 if (!e.failed) {
                     e.fixup_at[e.nr_fixup] = at;
                     e.fixup_to[e.nr_fixup] = (int)(((long *)target) - base);
@@ -1203,6 +1281,7 @@ struct bpf_insn *expr_to_bpf(struct expr_prog *prog, int *nr_insn)
              * the accumulator. */
             case OR: case XOR: case AND: case SHL: case SHR: case SAR:
             case ADD: case SUB: case MUL: case DIVu: case MODu:
+            case DIV: case MOD:
             case EQ: case NE:
             case LT: case GT: case LE: case GE:
             case LTu: case GTu: case LEu: case GEu: {
@@ -1217,19 +1296,45 @@ struct bpf_insn *expr_to_bpf(struct expr_prog *prog, int *nr_insn)
                     /* Arithmetic and bitwise: a = lhs <op> a. Operands are
                      * reversed relative to BPF's dst <op>= src, so compute
                      * into the slot register and move back. */
-                    case OR:   emit(&e, BPF_ALU64_REG(BPF_OR,  lhs, BPF_A)); goto commit;
-                    case XOR:  emit(&e, BPF_ALU64_REG(BPF_XOR, lhs, BPF_A)); goto commit;
-                    case AND:  emit(&e, BPF_ALU64_REG(BPF_AND, lhs, BPF_A)); goto commit;
-                    case SHL:  emit(&e, BPF_ALU64_REG(BPF_LSH, lhs, BPF_A)); goto commit;
-                    case SHR:  emit(&e, BPF_ALU64_REG(BPF_RSH, lhs, BPF_A)); goto commit;
-                    case SAR:  emit(&e, BPF_ALU64_REG(BPF_ARSH, lhs, BPF_A)); goto commit;
-                    case ADD:  emit(&e, BPF_ALU64_REG(BPF_ADD, lhs, BPF_A)); goto commit;
-                    case SUB:  emit(&e, BPF_ALU64_REG(BPF_SUB, lhs, BPF_A)); goto commit;
-                    case MUL:  emit(&e, BPF_ALU64_REG(BPF_MUL, lhs, BPF_A)); goto commit;
-                    case DIVu: emit(&e, BPF_ALU64_REG(BPF_DIV, lhs, BPF_A)); goto commit;
-                    case MODu: emit(&e, BPF_ALU64_REG(BPF_MOD, lhs, BPF_A)); goto commit;
+                    case OR:   emit(&e, BPF_ALU64_REG(BPF_OR,  lhs, BPF_ACC)); goto commit;
+                    case XOR:  emit(&e, BPF_ALU64_REG(BPF_XOR, lhs, BPF_ACC)); goto commit;
+                    case AND:  emit(&e, BPF_ALU64_REG(BPF_AND, lhs, BPF_ACC)); goto commit;
+                    case SHL:  emit(&e, BPF_ALU64_REG(BPF_LSH, lhs, BPF_ACC)); goto commit;
+                    case SHR:  emit(&e, BPF_ALU64_REG(BPF_RSH, lhs, BPF_ACC)); goto commit;
+                    case SAR:  emit(&e, BPF_ALU64_REG(BPF_ARSH, lhs, BPF_ACC)); goto commit;
+                    case ADD:  emit(&e, BPF_ALU64_REG(BPF_ADD, lhs, BPF_ACC)); goto commit;
+                    case SUB:  emit(&e, BPF_ALU64_REG(BPF_SUB, lhs, BPF_ACC)); goto commit;
+                    case MUL:  emit(&e, BPF_ALU64_REG(BPF_MUL, lhs, BPF_ACC)); goto commit;
+                    case DIVu: emit(&e, BPF_ALU64_REG(BPF_DIV, lhs, BPF_ACC)); goto commit;
+                    case MODu: emit(&e, BPF_ALU64_REG(BPF_MOD, lhs, BPF_ACC)); goto commit;
+                    /*
+                     * Signed division and modulo. This batch of instructions
+                     * did not spend two new opcodes on them: BPF_DIV and
+                     * BPF_MOD are reused, and the off field -- which every
+                     * other ALU instruction requires to be 0 -- selects signed
+                     * when set to 1. Hence BPF_RAW_INSN rather than
+                     * BPF_ALU64_REG(), whose off is hardcoded to 0.
+                     *
+                     * The verifier reads it exactly that way, in
+                     * adjust_scalar_min_max_vals():
+                     *      if (off == 1) scalar_min_max_sdiv(dst_reg, &src_reg);
+                     *      else          scalar_min_max_udiv(dst_reg, &src_reg);
+                     * and off==1 is rejected for any other opcode. A pre-6.6
+                     * kernel has no such exemption -- it requires off==0 for
+                     * every ALU op and answers "BPF_ALU uses reserved fields"
+                     * -- so the version check has to come first.
+                     */
+                    case DIV:
+                    case MOD:
+                        if (!e.cpu_v4) {
+                            emit_fail(&e, "signed division requires a 6.6+ kernel");
+                            break;
+                        }
+                        emit(&e, BPF_RAW_INSN(BPF_ALU64 | BPF_OP(op == DIV ? BPF_DIV : BPF_MOD) |
+                                              BPF_X, lhs, BPF_ACC, 1, 0));
+                        goto commit;
                     commit:
-                        emit(&e, BPF_MOV64_REG(BPF_A, lhs));
+                        emit(&e, BPF_MOV64_REG(BPF_ACC, lhs));
                         break;
 
                     case EQ:  emit_cmp(&e, BPF_JEQ, lhs); break;
@@ -1246,13 +1351,6 @@ struct bpf_insn *expr_to_bpf(struct expr_prog *prog, int *nr_insn)
                 }
                 break;
             }
-
-            /* Signed division and modulo need a sign-correction sequence;
-             * BPF_SDIV/BPF_SMOD only exist on 6.7+. Not worth it yet. */
-            case DIV:
-            case MOD:
-                emit_fail(&e, "signed division is not supported by the BPF backend");
-                break;
 
             /*
              * Store to an event field: `*sp++ = a', so the slot holds the
@@ -1288,15 +1386,15 @@ struct bpf_insn *expr_to_bpf(struct expr_prog *prog, int *nr_insn)
                 /* The slot holds a complete address, hence offset 0. The
                  * accumulator keeps the stored value, so an assignment still
                  * evaluates to it. */
-                emit(&e, BPF_STX_MEM(sz, slot_reg(&e, e.depth), BPF_A, 0));
+                emit(&e, BPF_STX_MEM(sz, slot_reg(&e, e.depth), BPF_ACC, 0));
                 break;
             }
 
             case NTHL:
-                emit(&e, BPF_ENDIAN(BPF_TO_BE, BPF_A, 32));
+                emit(&e, BPF_ENDIAN(BPF_TO_BE, BPF_ACC, 32));
                 break;
             case NTHS:
-                emit(&e, BPF_ENDIAN(BPF_TO_BE, BPF_A, 16));
+                emit(&e, BPF_ENDIAN(BPF_TO_BE, BPF_ACC, 16));
                 break;
 
             case PRTF:      emit_fail(&e, "printf() is not supported by the BPF backend"); break;
@@ -1326,12 +1424,12 @@ struct bpf_insn *expr_to_bpf(struct expr_prog *prog, int *nr_insn)
              *                       ones whose targets need fixing up.
              *
              * and, handled above by failing with a specific message rather
-             * than silently: DIV, MOD (signed division needs a sign-correction
-             * sequence; BPF_SDIV/BPF_SMOD are 6.7+), ADJ (function calls), and
-             * every builtin that returns or inspects a string -- PRTF, KSYM,
-             * COMM, STRNCMP, MATCH, STREQ, STRNE, SYSCALL, KVMEXIT, SYSTEM.
-             * Those need either userspace state (a symbol table, a pid->comm
-             * cache) or unbounded loops, neither of which exists here.
+             * than silently: ADJ (function calls), and every builtin that
+             * returns or inspects a string -- PRTF, KSYM, COMM, STRNCMP,
+             * MATCH, STREQ, STRNE, SYSCALL, KVMEXIT, SYSTEM. Those need
+             * either userspace state (a symbol table, a pid->comm cache) or
+             * unbounded loops, neither of which exists here. DIV and MOD are
+             * handled, but fail on kernels below 6.6.
              */
             default:
                 emit_fail(&e, "unsupported instruction");

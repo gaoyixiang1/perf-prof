@@ -116,6 +116,7 @@ subprogram。它在 `bpf_object__load()` 内部才被 `bpf_object__relocate_call
 | `src/expr.c` | `expr_to_bpf()` 后端。`CONFIG_LIBBPF` 包裹。不依赖 libbpf/BTF |
 | `src/bpf_expr_filter.c` | 全部 BPF 相关逻辑：找占位符、读 BTF 布局、安装指令 |
 | `lib/bpf/libbpf.c` | `bpf_object__find_subprog_by_name()`（本地新增） |
+| `include/linux/filter.h` | `BPF_LDX_MEM` 等指令构造宏。**逐字取自内核 `tools/include/linux/filter.h`**，升级时整体替换，不要在里面打补丁 |
 
 职责边界是刻意的：`expr.c` 只认 `prog->data + offset` 这个抽象，对事件源、libbpf、BTF 零
 依赖；所有 BPF/BTF 知识集中在 `bpf_expr_filter.c`。
@@ -175,8 +176,8 @@ if (kvm_exit_bpf__load(ctx->obj))
 
 | 寄存器 | 用途 |
 |--------|------|
-| `r1` | 事件指针（入口参数），全程不被破坏 |
-| `r0` | 累加器，对应 VM 的 `a` 寄存器；同时是返回值：非 0 保留事件，0 丢弃 |
+| `r1` | 事件指针（入口参数），全程不被破坏。代码里叫 `BPF_EVENT` |
+| `r0` | 累加器，对应 VM 的 `a` 寄存器；同时是返回值：非 0 保留事件，0 丢弃。代码里叫 `BPF_ACC`——不能叫 `BPF_A`，那是 `<uapi/linux/filter.h>` 里传统 BPF 的一个寻址模式 |
 | `r2`–`r9` | 表达式栈槽 |
 
 ### 5.2 栈槽映射到寄存器
@@ -207,7 +208,7 @@ if (kvm_exit_bpf__load(ctx->obj))
 
 ```c
 offset = id->value - (long)prog->data;
-EMIT(BPF_LDX_MEM(size, BPF_A, BPF_REG_1, offset));
+EMIT(BPF_LDX_MEM(size, BPF_ACC, BPF_REG_1, offset));
 ```
 
 赋值是完全对偶的：**`IMM addr; PSH; <值>; SI type`** → `BPF_STX_MEM`。
@@ -220,6 +221,28 @@ EMIT(BPF_LDX_MEM(size, BPF_A, BPF_REG_1, offset));
 | `SHORT` | 2 | `BPF_H` |
 | `INT` | 4 | `BPF_W` |
 | `LONG` / 指针 | 8 | `BPF_DW` |
+
+#### 5.3.1 IMM 的三种归类
+
+`IMM` 的操作数可能是字段地址、字符串字面量地址，或者一个普通立即数。三者只能靠**地址区间**
+区分，因此区间两端都要收紧，否则足够大的常量会被误判成地址：
+
+| 判据 | 归类 | 生成 |
+|------|------|------|
+| `data ≤ v < data + datalen`，且下一条是 `LI` | 字段读 | `BPF_LDX_MEM`（折叠） |
+| `data ≤ v < data + datalen` | 字段取址 | `MOV r0,r1` + `ADD imm` |
+| `str ≤ v < str + strsize` | 字符串字面量 | 报错，见 5.9 |
+| 其余 | 立即数 | `BPF_MOV64_IMM` / `ld_imm64`，见 5.5.1 |
+
+两处上界的取值有讲究：
+
+- 用 `datalen` 而不是 `datasize`。`datalen` 是声明字段占据的实际范围 `max(offset + size)`；
+  `datasize` 是按 256 字节向上取整的**分配容量**——tracepoint 记录有变长部分，
+  `expr_load_data()` 要按容量拷贝，所以 `datasize` 必须保持是容量。用容量做判据会把最后一个
+  字段之后的空隙也算成字段。eBPF 事件是定长结构体，`datalen` 即精确值。
+- `prog->str` 只存放表达式自己的字符串字面量；声明的全局变量名另存在 `prog->names`。
+  两者分开，"这个地址是不是字面量"才是一个干净的区间判断，变量名不会落进来。
+  `-v` 输出的 `Strings:` 一节也因此只列真正的字面量。
 
 ### 5.4 数组下标
 
@@ -260,19 +283,77 @@ invalid access to map value, value_size=299080 off=561116 size=4
 
 | VM 指令 | eBPF | 说明 |
 |---------|------|------|
-| `IMM`（字段）+ `LI` | `BPF_LDX_MEM` | 折叠成一条，见 5.3 |
+| `IMM`（字段）+ `LI` | `BPF_LDX_MEM` / MEMSX | 折叠成一条，见 5.3；有符号窄字段见 5.8 |
 | `IMM`（字段），无 `LI` | `MOV r0,r1` + `ADD imm` | 取址：`&pid`，以及数组下标的基址，见 5.4 |
-| `IMM`（立即数） | `BPF_MOV64_IMM` | |
-| `IMM addr;PSH;值;SI` | `BPF_STX_MEM` | 赋值 |
+| `IMM`（立即数） | `BPF_MOV64_IMM` / `ld_imm64` | 超过 32 位用后者，见 5.5.1 |
+| `IMM addr;PSH;值;SI` | `BPF_STX_MEM` | 赋值。store 侧不需要符号处理，见 5.8 |
 | `PSH` | `BPF_MOV64_REG(slot, r0)` | 栈槽即寄存器 |
 | `OR XOR AND ADD SUB MUL` | `BPF_ALU64_REG` | 一对一 |
 | `SHL SHR SAR` | `BPF_LSH / BPF_RSH / BPF_ARSH` | |
-| `DIVu MODu` | `BPF_DIV / BPF_MOD` | 仅无符号 |
+| `DIVu MODu` | `BPF_DIV / BPF_MOD` | 无符号，`off=0` |
+| `DIV MOD` | `BPF_DIV / BPF_MOD` + `off=1` | 有符号，6.6+，见 5.5.2 |
 | `EQ NE LT GT LE GE`（含 u 变体） | 4 条，见 5.6 | eBPF 无 set-on-condition |
 | `BZ / BNZ` | `BPF_JMP_IMM(JEQ/JNE, r0, 0, ...)` | 目标需回填 |
 | `JMP` | `BPF_JMP_A` | 目标需回填 |
 | `NTHL / NTHS` | `BPF_ENDIAN(BPF_TO_BE, 32/16)` | 一条搞定 |
 | `EXIT` | `BPF_EXIT_INSN` | 结果已在 r0 |
+
+#### 5.5.1 宽立即数
+
+`BPF_MOV64_IMM` 只能带 32 位、且做符号扩展，更宽的常量用 `ld_imm64`：它占**两个指令槽**，
+低 32 位在第一个槽的 `imm`，高 32 位在第二个槽的 `imm`。
+
+```
+--filter 'latency > 10000000000'          10000000000 = 0x2_540BE400
+
+    0: r0 = *(u64 *)(r1 + 16)             ← latency
+    1: r2 = r0
+    2: code=0x18  imm=1410065408          ← ld_imm64 低半：0x540BE400
+    3: code=0x00  imm=2                   ← 高半；opcode 为 0，不是独立指令
+    4: if r2 > r0 goto +2
+```
+
+第二个槽的 opcode 必须是 0，它不是一条独立指令，但**占一个槽位**。跳转偏移本来就按槽位计数，
+所以回填（5.7）不需要为它做任何特殊处理。
+
+#### 5.5.2 有符号 `/` `%`
+
+BPF 指令集第 4 版（clang 的 `-mcpu=v4`，内核 6.6）没有为有符号除法新增 opcode，而是
+**复用 `BPF_DIV`/`BPF_MOD`，用 `off` 字段区分**：`off=0` 无符号，`off=1` 有符号。这是唯一
+一处 ALU 指令的 `off` 有含义，其余 ALU 指令都要求它为 0。
+
+因此后端不能用 `BPF_ALU64_REG()`——它把 `off` 写死成 0——只能用 `BPF_RAW_INSN()`。
+
+```
+--filter 'latency / 1000 > 5'
+
+    0: r0 = *(u64 *)(r1 + 16)             ← latency
+    1: r2 = r0
+    2: r0 = 1000
+    3: code=0x3f dst=r2 src=r0 off=1      ← BPF_ALU64|BPF_DIV|BPF_X，off=1 即有符号
+    4: r0 = r2
+    7: code=0x6d if r2 s> r0 goto +2      ← JSGT
+```
+
+verifier 也是这么读的（`adjust_scalar_min_max_vals()`）：
+
+```c
+if (off == 1) scalar_min_max_sdiv(dst_reg, &src_reg);
+else          scalar_min_max_udiv(dst_reg, &src_reg);
+```
+
+6.6 之前的内核没有这个例外，所有 ALU 指令都必须 `off=0`，`off=1` 会被拒：
+
+```
+BPF_ALU uses reserved fields
+```
+
+所以版本判断必须在生成指令**之前**做（`--filter 'latency / 1000 > 5'` 在低版本内核上直接报
+`signed division requires a 6.6+ kernel`），否则错误会推迟到 verifier，且信息晦涩。
+
+> 版本判断是**运行时**的：perf-prof 编译一次、可能跑在任意内核上，过滤器是为"即将加载进去的
+> 那个内核"生成的。`kernel_release()` 要读 `uname()`，结果缓存在 `struct bpf_emit` 里，每次
+> 翻译只取一次。
 
 ### 5.6 比较：顺序很关键
 
@@ -301,15 +382,34 @@ r0 = 1
 
 ### 5.8 符号扩展
 
-`BPF_LDX_MEM` 是**零扩展**。窄的有符号字段需要手工符号扩展，否则有符号比较行为和用户态
-VM 不一致：
+`BPF_LDX_MEM` 是**零扩展**。用户态 VM 的 `LI` 按字段自己的类型解引用，窄的有符号字段读出来
+就是符号扩展过的，所以后端必须补上，否则后面每一个有符号比较的结果都和用户态 VM 不一致。
+
+按内核版本走两条路径：
+
+| 内核 | 生成 |
+|------|------|
+| 6.6+ | 一条 `ldx` 走 MEMSX 模式（`code = BPF_LDX \| size \| BPF_MEMSX`），尺寸只有 B/H/W——DW 加载已填满寄存器，无可扩展 |
+| 更早 | 零扩展加载后，把符号位移到 bit 63 再算术移回 |
 
 ```c
-EMIT(BPF_ALU64_IMM(BPF_LSH, BPF_A, bits));
-EMIT(BPF_ALU64_IMM(BPF_ARSH, BPF_A, bits));
+/* 6.6 之前 */
+EMIT(BPF_ALU64_IMM(BPF_LSH,  BPF_ACC, bits));
+EMIT(BPF_ALU64_IMM(BPF_ARSH, BPF_ACC, bits));
 ```
 
-（`BPF_MEMSX` 一条即可，但那是 6.7+。）
+两个加载点共用 `emit_load()`：5.3 里折叠成一条的字段读，以及 `LI` 单独出现、地址已经在累加器
+里的情况（`*(char *)((char *)&latency + 1)` 这种先算地址的形式）。
+
+以 `*(char *)((char *)&latency + 1) < 0` 为例，`latency` 偏移 16，取第 1 个字节：
+
+```
+    5: r0 = r2                        ← 地址算完在累加器里
+    6: code=0x71 r0 = *(u8 *)(r0+0)   ← BPF_LDX|B|MEM，零扩展
+    7: r0 <<= 56                      ← 补符号扩展
+    8: r0 s>>= 56
+   11: code=0xcd if r2 s< r0 goto +2  ← JSLT，有符号
+```
 
 ### 5.9 不支持的构造
 
@@ -317,8 +417,8 @@ EMIT(BPF_ALU64_IMM(BPF_ARSH, BPF_A, bits));
 
 | 构造 | 原因 |
 |------|------|
-| `_cpu` / `_pid` | perf 采样头字段，内核侧不存在（见 5.3 注脚） |
-| 有符号 `/` `%` | 需要符号修正序列；`BPF_SDIV`/`BPF_SMOD` 是 6.7+ |
+| `_cpu` / `_pid` | perf 采样头字段，内核侧不存在（见下文） |
+| 有符号 `/` `%`（6.6 以下） | 该编码是 6.6+，低版本内核无对应指令，见 5.5.2 |
 | `ksymbol()` | 依赖用户态 `/proc/kallsyms` 符号表 |
 | `comm_get()` | 依赖用户态 pid→comm 缓存 |
 | `printf()` / `system()` | 是输出/执行动作，不是过滤 |
