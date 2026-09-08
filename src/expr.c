@@ -50,11 +50,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <setjmp.h>
+#include <stdarg.h>
 #include <arpa/inet.h>
 
 #include <monitor.h>
 #ifdef CONFIG_LIBBPF
 #include <linux/filter.h>
+#include <linux/bpf_disasm.h>
 #endif
 #include <tep.h>
 #include <expr.h>
@@ -115,6 +117,18 @@ static void synerr(const char *s)
     printf("%s\n", lp);
     printf("%*s%s\n", (int)(p-lp+1), "^ ", s);
     longjmp(synerr_jmp, -1);
+}
+
+/*
+ * Whether `t' is a `char *' for the string operators (~, ==, !=), ignoring
+ * signedness: since 3bc753c06dd0 ("kbuild: treat char as always unsigned"),
+ * in v6.2, the kernel is built with -funsigned-char, so a `char comm[16]' is
+ * described as signed:0 and arrives here as unsigned. No string operator
+ * looks at the sign of a character, so accept either spelling.
+ */
+static bool is_char_ptr(long t)
+{
+    return (t & ~UNSIGNED) == (CHAR|PTR);
 }
 
 static int typeop(int op)
@@ -332,13 +346,13 @@ static void expr(int lev)
         else if (tk == And) { next(); *++e = PSH; expr(Eq);  *++e = AND; ty = INT; }
         else if (tk == Eq)  {
             next(); *++e = PSH; expr(Lt);
-            if (t == (CHAR|PTR) && ty == (CHAR|PTR)) *++e = STREQ;
+            if (is_char_ptr(t) && is_char_ptr(ty)) *++e = STREQ;
             else *++e = EQ;
             ty = INT;
         }
         else if (tk == Ne)  {
             next(); *++e = PSH; expr(Lt);
-            if (t == (CHAR|PTR) && ty == (CHAR|PTR)) *++e = STRNE;
+            if (is_char_ptr(t) && is_char_ptr(ty)) *++e = STRNE;
             else *++e = NE;
             ty = INT;
         }
@@ -347,9 +361,9 @@ static void expr(int lev)
         else if (tk == Le)  { next(); *++e = PSH; expr(Shl); *++e = (t>=PTR || ty>=PTR || ((t|ty)&UNSIGNED))?LEu:LE;  ty = INT; }
         else if (tk == Ge)  { next(); *++e = PSH; expr(Shl); *++e = (t>=PTR || ty>=PTR || ((t|ty)&UNSIGNED))?GEu:GE;  ty = INT; }
         else if (tk == Match) {
-            if ( t != (CHAR|PTR)) synerr("~ operator requires char * operand");
+            if (!is_char_ptr(t)) synerr("~ operator requires char * operand");
             next(); *++e = PSH; expr(Shl);
-            if (ty != (CHAR|PTR)) synerr("~ operator requires char * operand");
+            if (!is_char_ptr(ty)) synerr("~ operator requires char * operand");
             *++e = MATCH; ty = INT;
         }
         else if (tk == Shl) { next(); *++e = PSH; expr(Add); *++e = SHL; ty = INT; }
@@ -1480,15 +1494,53 @@ out:
     return NULL;
 }
 
+static void print_insn(void *private_data, const char *fmt, ...)
+{
+    va_list args;
+
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+}
+
+/*
+ * Disassemble the generated program in the syntax `bpftool prog dump xlated'
+ * prints, e.g.
+ *
+ *      0: (79) r0 = *(u64 *)(r1 +8)
+ *      1: (bf) r2 = r0
+ *      2: (25) if r2 > 0x64 goto pc+2
+ *
+ * The formatting is the kernel's own print_bpf_insn() (lib/bpf_disasm.c, a
+ * verbatim copy of kernel/bpf/disasm.c), which bpftool links against rather
+ * than reimplements -- so this output and bpftool's cannot drift apart. This
+ * function is bpftool's dump_xlated_plain() minus everything that only applies
+ * to a loaded program: there is no BTF, no line info, and no kallsyms, since
+ * the program has not been through the verifier yet and calls nothing.
+ */
 void expr_bpf_dump(struct bpf_insn *insn, int nr_insn)
 {
+    const struct bpf_insn_cbs cbs = {
+        .cb_print = print_insn,
+    };
+    bool double_insn = false;
     int i;
 
     printf("BPF instruction:\n");
-    for (i = 0; i < nr_insn; i++)
-        printf("  %3d: code=0x%02x dst=r%u src=r%u off=%-4d imm=%d\n",
-               i, insn[i].code, insn[i].dst_reg, insn[i].src_reg,
-               insn[i].off, insn[i].imm);
+    for (i = 0; i < nr_insn; i++) {
+        /* The second half of an ld_imm64 is not an instruction of its own; it
+         * was consumed by the one before it. It still occupies an index, so
+         * that the pc%+d in the jumps above stays meaningful. */
+        if (double_insn) {
+            double_insn = false;
+            continue;
+        }
+        double_insn = insn[i].code == (BPF_LD | BPF_IMM | BPF_DW);
+
+        printf("  %3d: ", i);
+        /* print_bpf_insn() terminates the line itself. */
+        print_bpf_insn(&cbs, insn + i, true);
+    }
 }
 
 #endif /* CONFIG_LIBBPF */
