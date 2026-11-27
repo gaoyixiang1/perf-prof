@@ -278,6 +278,11 @@ __x64_sys_clone / fork / vfork
 - 依赖：`src/filter/perf_event.bpf.c`
 - 做法与后果：在这之前，`task->thread_info` 的 CO-RE 重定位失败，程序加载失败。
 
+#### cfs_rq 的运行队列计数字段
+- 内核：`kernel/sched/sched.h`；736c55a02c47 ("sched/fair: Rename cfs_rq.nr_running into nr_queued"), in v6.14，把 `cfs_rq::nr_running` 改名为 `nr_queued`
+- 依赖：`src/filter/perf_event.bpf.c` `cfs_rq_nr_running()`；`--nr_running_min` / `--nr_running_max` 在没有 `se.cfs_rq->rq` 时读取当前任务的 CFS 队列计数
+- 做法与后果：用 CO-RE flavor 在运行内核中选择 `nr_queued` 或 `nr_running`，不按版本号判断（兼容回移植）；直接用编译机 `vmlinux.h` 中不存在的成员，clang 会在 CO-RE 重定位前报错。`rq::nr_running` 分支不受此更名影响。
+
 #### bpf_jit_kallsyms
 - 内核：`kernel/bpf/core.c` `bpf_prog_kallsyms_find()`、`include/linux/filter.h` `bpf_jit_kallsyms_enabled()`；74451e66d516 ("bpf: make jited programs visible in traces"), in v4.11；af91acbc6299 ("bpf: Fix bpf jit kallsym access"), in v5.5
 - 依赖：`src/monitor.c` `sysctl_bpf_jit_kallsyms()`；`src/misc.c` `ksymbol_dev_open()`
@@ -357,6 +362,11 @@ BPF 程序的上下文里补齐。BPF 程序挂在 hook 上，对所有任务、
 - 内核：`kernel/events/core.c` `perf_event_set_output()`；v3.10 已有
 - 依赖：`src/bpf_event.c` `bpf_event_new()`
 - 做法与后果：`output_event->cpu != event->cpu` 时拒绝，所以进程 scope（evsel 绑定线程、其他 tracepoint 共享 ring）下 BPF_OUTPUT 仍然每 cpu 自建 ring，cpu domain 与 task domain 靠 libperf 共存。
+
+#### task_struct 的当前 cpu 号的位置
+- 内核：`include/linux/sched.h` `task_struct`、`include/linux/thread_info.h`；c65eacbe290b ("sched/core: Allow putting thread_info into task_struct"), in v4.9 起 THREAD_INFO_IN_TASK 时 cpu 在 `task_struct::cpu`；bcf9033e5449 ("sched: move CPU field back into thread_info if THREAD_INFO_IN_TASK=y"), in v5.16-rc1 起移到 `task_struct::thread_info.cpu`
+- 依赖：`src/bpf-skel/sched_rundelay.bpf.c` `task_cpu()`
+- 做法与后果：两种布局都用 CO-RE flavor 读取，不比较版本号；没有 THREAD_INFO_IN_TASK 时两者都不存在，返回 -1。直接写 `t->cpu` 在 vmlinux.h 缺成员时编译失败，`bpf_core_field_exists()` 挡不住编译期错误。
 
 #### sched_switch 的参数与 task_struct::state
 - 内核：c73464b1c843 ("sched/core: Fix trace_sched_switch()"), in v4.4 起 raw_tp 参数是 `(bool preempt, prev, next)`；fa2c3254d7cf ("sched/tracing: Don't re-read p->state when emitting sched_switch event"), in v5.18 追加 `prev_state`；2f064a59a11f ("sched: Change task_struct::state"), in v5.14 起 `state` 改名为 `__state`
